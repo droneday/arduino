@@ -1,7 +1,8 @@
+#include <MemoryFree.h>
 #include "I2Cdev.h"
 
-#include "MPU6050.h" // not necessary if using MotionApps include file
-#include "helper_3dmath.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+//#include "MPU6050.h" // not necessary if using MotionApps include file
 
 // Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
 // is used in I2Cdev.h
@@ -11,8 +12,50 @@
 
 MPU6050 mpu;
 
+//#define OUTPUT_READABLE_YAWPITCHROLL
+//#define OUTPUT_TEAPOT
+
+
+
 #define LED_PIN 13 // (Arduino is 13, Teensy is 11, Teensy++ is 6)
 bool blinkState = false;
+
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus = 3;  // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float euler[3];         // [psi, theta, phi]    Euler angle container
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
+// packet structure for InvenSense teapot demo
+uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\n' };
+
+
+
+// ================================================================
+// ===               INTERRUPT DETECTION ROUTINE                ===
+// ================================================================
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+    mpuInterrupt = true;
+}
+
+
+
+// ================================================================
+// ===                      INITIAL SETUP                       ===
+// ================================================================
 
 void setup() {
     // configure LED for output
@@ -36,169 +79,206 @@ void setup() {
     Serial.println(F("Initializing MPU6050..."));
     mpu.initialize();
     Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
-  
+calibrate_imu();
+    //devStatus = mpu.dmpInitialize();
+    
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.print(F("packetSize1 = "));
+    Serial.println(mpu.dmpPacketSize);
+    
+    if(devStatus != 0)
+    {
+       // ERROR!
+      // 1 = initial memory load failed
+      // 2 = DMP configuration updates failed
+      // (if it's going to break, usually the code will be 1)
+      Serial.print(F("DMP Initialization failed (code "));
+      Serial.print(devStatus);
+      Serial.println(F(")"));
+      
+      // spin in error loop blinking LED until reset
+      while(true)
+      {
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+        delay(250);
+      }
+    }
+    
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.print(F("packetSize2 = "));
+    Serial.println(mpu.dmpPacketSize);
+    
     calibrate_imu();
-/*
-float x,y,z;
-    quat2rpy(rpy2quat(0.1, .2, .3), &x, &y, &z);
-    Serial.println(x);
-        Serial.println(y);
-            Serial.println(z);
-            */
+
+    // turn on the DMP, now that it's ready
+    mpu.setDMPEnabled(true);
+    
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.print(F("packetSize4 = "));
+    Serial.println(mpu.dmpPacketSize);
+
+    // enable Arduino interrupt detection
+    attachInterrupt(0, dmpDataReady, RISING); // INT0 is pin D2 on ATMEGA328P
+    mpuIntStatus = mpu.getIntStatus();
+
+    // set our DMP Ready flag so the main loop() function knows it's okay to use it
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    dmpReady = true;
+
+    // get expected DMP packet size for later comparison
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.print(F("packetSize5 = "));
+    Serial.println(mpu.dmpPacketSize);
+    packetSize=42;
 }
 
-void printrpy(float roll, float pitch, float yaw)
-{
-    Serial.print("ypr\t");
-    Serial.print(yaw*180/M_PI);
-    Serial.print("\t");
-    Serial.print(pitch*180/M_PI);
-    Serial.print("\t");
-    Serial.println(roll*180/M_PI);
-}
-
-void printQuaternion(Quaternion q)
-{
-  Serial.print("q(");
-  Serial.print(q.w);
-  Serial.print(", ");
-  Serial.print(q.x);
-  Serial.print(", ");
-  Serial.print(q.y);
-  Serial.print(", ");
-  Serial.print(q.z);
-  Serial.println(")");
-}
-
-float gyro_offset[3];
 void calibrate_imu()
 {
+    Serial.print("Offsets were: ");
+    Serial.print(mpu.getXGyroOffset());
+    Serial.print(", ");
+    Serial.print(mpu.getYGyroOffset());
+    Serial.print(", ");
+    Serial.print(mpu.getZGyroOffset());
+    
     // zupt gyros
     Serial.println("Calibrating gyros");
     
     int16_t thisgyro[3];
-    int32_t sum[3] = {0,0,0};
-    int N = 1024;
+    int32_t avg[3] = {0,0,0};
+    int N = 600;
     for(int i = 0; i < N; i++){
-      mpu.getRotation(&thisgyro[0], &thisgyro[1], &thisgyro[2]);
+      mpu.dmpGetGyro(thisgyro);
       for(int j = 0; j < 3; j++){
-        sum[j] += thisgyro[j];
+        avg[j] += thisgyro[j];
       }
+      delay(1000);
+      Serial.print("gyros ");
+      Serial.print(thisgyro[0]);
+      Serial.print(" ");
+      Serial.print(thisgyro[1]);
+      Serial.print(" ");
+      Serial.println(thisgyro[2]);
     }
+    
+    Serial.print(F("packetSize2.5 = "));
+    Serial.println(mpu.dmpPacketSize);
     
     for(int j = 0; j < 3; j++){
-      gyro_offset[j] = (float)sum[j] / N;
+      avg[j] /= N;
     }
     
-    Serial.print("gyros offsets are ");
-    Serial.print(gyro_offset[0]);
-    Serial.print(" ");
-    Serial.print(gyro_offset[1]);
-    Serial.print(" ");
-    Serial.println(gyro_offset[2]);
+    mpu.setXGyroOffset((int16_t)avg[0]);
+    mpu.setYGyroOffset((int16_t)avg[1]);
+    mpu.setZGyroOffset((int16_t)avg[2]);
+      
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.print(F("packetSize3 = "));
+    Serial.println(mpu.dmpPacketSize);
+
+    Serial.print("Offsets are now: ");
+    Serial.print(mpu.getXGyroOffset());
+    Serial.print(", ");
+    Serial.print(mpu.getYGyroOffset());
+    Serial.print(", ");
+    Serial.print(mpu.getZGyroOffset());
+    //Serial.print(", ");
+    //Serial.print(mpu.getXAccelOffset());
+    //Serial.print(", ");
+    //Serial.print(mpu.getYAccelOffset());
+    //Serial.print(", ");
+    //Serial.print(mpu.getZAccelOffset());
+    Serial.println();
+    
+      for(int i = 0; i < 50; i++){
+        mpu.dmpGetGyro(thisgyro);
+        Serial.print("gyros ");
+        Serial.print(thisgyro[0]);
+        Serial.print(" ");
+        Serial.print(thisgyro[1]);
+        Serial.print(" ");
+        Serial.println(thisgyro[2]);
+      }
 }
 
-float yaw=0, pitch=0, roll=0;
-void loop() {
 
-    readIMU();
-    
-    /*
-    static unsigned char count = 0;
-    if(!count++)
-    {
-      static int lastTime = millis();
-      int thisTime = millis();
-      Serial.print(256./((thisTime-lastTime)/1000.));
-      Serial.println(" Hz");
-      lastTime = thisTime;
+
+// ================================================================
+// ===                    MAIN PROGRAM LOOP                     ===
+// ================================================================
+
+void loop() {
+    // wait for MPU interrupt or extra packet(s) available
+    while (!mpuInterrupt && fifoCount < packetSize) {
+        // other program behavior stuff here
+        // .
+        // .
+        // .
+        // if you are really paranoid you can frequently test in between other
+        // stuff to see if mpuInterrupt is true, and if so, "break;" from the
+        // while() loop to immediately process the MPU data
+        // .
+        // .
+        // .
     }
-    */
+    // if we've exited the loop, we have an IMU packet to process
+    readIMU();
 
     // blink LED to indicate activity
     blinkState = !blinkState;
     digitalWrite(LED_PIN, blinkState);
 }
 
-Quaternion rpy2quat(float x, float y, float z)
-{
-  Quaternion qx(cos(x/2), sin(x/2), 0, 0);
-  Quaternion qy(cos(y/2), 0, sin(y/2), 0);
-  Quaternion qz(cos(z/2), 0, 0, sin(z/2));
-  Quaternion q = qx.getProduct(qy.getProduct(qz));
-  return q;
-}
-
-// convert to YPR   
-void quat2rpy(Quaternion q, float* roll, float* pitch, float* yaw)
-{
-//  *roll = atan2(2.0*(q.y*q.z + q.w*q.x), q.w*q.w - q.x*q.x - q.y*q.y + q.z*q.z);
-//  *pitch = asin(-2.0*(q.x*q.z - q.w*q.y));
-//  *yaw = atan2(2.0*(q.x*q.y + q.w*q.z), q.w*q.w + q.x*q.x - q.y*q.y - q.z*q.z);
-  
-  q.x = -q.x; q.y = -q.y; q.z = -q.z;
-  *roll = atan2(2.0*(q.y*q.z + q.w*q.x), q.w*q.w - q.x*q.x - q.y*q.y + q.z*q.z);
-  *pitch = asin(-2.0*(q.x*q.z - q.w*q.y));
-  *yaw = atan2(2.0*(q.x*q.y + q.w*q.z), q.w*q.w + q.x*q.x - q.y*q.y - q.z*q.z);
-  *yaw = -*yaw; *pitch = -*pitch; *roll = -*roll;
-}
-
 void readIMU()
 {
-  // over what period are we integrating?
-  static int lastTime = millis();
-  int thisTime = millis();
-  float dt = float(thisTime - lastTime)/1000;
-  lastTime = thisTime;
-  
-  // get body-frame rotational velocities and linear accelerations
-  int16_t accel[3], gyro[3];
-  mpu.getMotion6(&accel[0], &accel[1], &accel[2], &gyro[0], &gyro[1], &gyro[2]);
-  
-  // get this-axis rotation in radians
-  // 131 LSB/deg/sec, pi/180 rad/deg
-  float xRot = (gyro[0] - gyro_offset[0]) / 131 * M_PI / 180 * dt;
-  float yRot = (gyro[1] - gyro_offset[1]) / 131 * M_PI / 180 * dt;
-  float zRot = (gyro[2] - gyro_offset[2]) / 131 * M_PI / 180 * dt;
-  float xAcc = accel[0] / 8192.;
-  float yAcc = accel[1] / 8192.;
-  float zAcc = accel[2] / 8192.;
-  
-  //Serial.print("\nRotated by ");
-  //printrpy(xRot, yRot, zRot);
-  
-  // convert to quaternions
-  Quaternion fullOrientation = rpy2quat(roll, pitch, yaw);
-  Quaternion thisRotation = rpy2quat(xRot, yRot, zRot);
-  
-  //Serial.print(" = ");
-  //printQuaternion(thisRotation);
-  //Serial.print("old orientation ");
-  //printQuaternion(fullOrientation);
-  
-  // rotate orientation by this rotation
-  fullOrientation = thisRotation.getProduct(fullOrientation);
-  fullOrientation.normalize();
-  
-  //Serial.print("new orientation ");
-  //printQuaternion(fullOrientation);
-  
-  // convert back to roll pitch yaw
-  quat2rpy(fullOrientation, &roll, &pitch, &yaw);
-  
-  // accel
-  float accel_pitch = -atan2(xAcc, zAcc);
-  float accel_roll = atan2(yAcc, zAcc);
 
-  // downweight accel measurement if the thing is accelerating (forces other than just gravity)
-  float accelMag = sqrt(xAcc*xAcc + yAcc*yAcc + zAcc*zAcc);
-  float accelFrac = 0.02 * exp(-4*abs(1 - accelMag));
-  //Serial.print(" accelFrac ");
-  //Serial.println(accelFrac);
-  
-  // fuse gyro integration with low-pass accel
-  pitch = pitch*(1-accelFrac) + accel_pitch*accelFrac;
-  roll = roll*(1-accelFrac) + accel_roll*accelFrac;
-  
-  printrpy(roll, pitch, yaw);
+    // reset interrupt flag and get INT_STATUS byte
+    mpuInterrupt = false;
+    mpuIntStatus = mpu.getIntStatus();
+
+    // get current FIFO count
+    fifoCount = mpu.getFIFOCount();
+
+    // check for overflow (this should never happen unless our code is too inefficient)
+    if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+        // reset so we can continue cleanly
+        mpu.resetFIFO();
+        Serial.println(F("FIFO overflow!"));
+
+    // otherwise, check for DMP data ready interrupt (this should happen frequently)
+    } else if (mpuIntStatus & 0x02) {
+        // wait for correct available data length, should be a VERY short wait
+        while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+        // read a packet from FIFO
+        mpu.getFIFOBytes(fifoBuffer, packetSize);
+        fifoCount -= packetSize;
+
+        #ifdef OUTPUT_READABLE_YAWPITCHROLL
+            // display Euler angles in degrees
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+            Serial.print("ypr\t");
+            Serial.print(ypr[0] * 180/M_PI);
+            Serial.print("\t");
+            Serial.print(ypr[1] * 180/M_PI);
+            Serial.print("\t");
+            Serial.println(ypr[2] * 180/M_PI);
+        #endif
+
+        #ifdef OUTPUT_TEAPOT
+            // display quaternion values in InvenSense Teapot demo format:
+            teapotPacket[2] = fifoBuffer[0];
+            teapotPacket[3] = fifoBuffer[1];
+            teapotPacket[4] = fifoBuffer[4];
+            teapotPacket[5] = fifoBuffer[5];
+            teapotPacket[6] = fifoBuffer[8];
+            teapotPacket[7] = fifoBuffer[9];
+            teapotPacket[8] = fifoBuffer[12];
+            teapotPacket[9] = fifoBuffer[13];
+            Serial.write(teapotPacket, 14);
+            teapotPacket[11]++; // packetCount, loops at 0xFF on purpose
+        #endif
+    } 
 }
