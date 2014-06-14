@@ -27,7 +27,7 @@ SoftwareSerial bluetooth(bluetoothRx, bluetoothTx);
 String bluetoothBuffer = "";
 
 // Current movement state received over Bluetooth.
-int moveX, moveY, moveZ, yawTurn;
+int cmdPitch, cmdRoll, cmdYaw, cmdThrottle;
 
 MPU6050 mpu;
 
@@ -238,9 +238,10 @@ void bluetoothSetup() {
     digitalWrite(bluetoothKey, LOW);
   }
 
-  // Set up serial.
+  // Set up serial. 9600 is default baud.
+  // TODO: See if this is fast enough, and potentially raise
+  // to a higher baud rate through AT commands.
   bluetooth.begin(9600);
-  bluetooth.println("hello world");
 
   // Default drone name,
   bluetoothATCommand("AT+NAME=" BLUETOOTH_DRONE_NAME);
@@ -287,15 +288,16 @@ String bluetoothATCommand(String command) {
 
 // Dump current configured control state over Bluetooth channel.
 void bluetoothDumpState() {
-  bluetooth.print("X: ");
-  bluetooth.print(moveX);
-  bluetooth.print(" Y: ");
-  bluetooth.print(moveY);
-  bluetooth.print(" Z: ");
-  bluetooth.print(moveZ);
-  bluetooth.print(" T: ");
-  bluetooth.print(yawTurn);
+  bluetooth.print("Pitch: ");
+  bluetooth.print(cmdPitch);
+  bluetooth.print(" Roll: ");
+  bluetooth.print(cmdRoll);
+  bluetooth.print(" Yaw: ");
+  bluetooth.print(cmdYaw);
+  bluetooth.print(" Throttle: ");
+  bluetooth.print(cmdThrottle);
   bluetooth.println();
+  // TODO: Dump other useful info here.
 }
 
 // Parse and execute a complete command read from the Bluetooth
@@ -308,17 +310,17 @@ void bluetoothCommand() {
 
     // Normal flight commands: Adjust position and turn on
     // axis.
-    case 'X':
-      moveX = bluetoothBuffer.substring(1).toInt();
+    case 'P':
+      cmdPitch = bluetoothBuffer.substring(1).toInt();
+      break;
+    case 'R':
+      cmdRoll = bluetoothBuffer.substring(1).toInt();
       break;
     case 'Y':
-      moveY = bluetoothBuffer.substring(1).toInt();
-      break;
-    case 'Z':
-      moveZ = bluetoothBuffer.substring(1).toInt();
+      cmdYaw = bluetoothBuffer.substring(1).toInt();
       break;
     case 'T':
-      yawTurn = bluetoothBuffer.substring(1).toInt();
+      cmdThrottle = bluetoothBuffer.substring(1).toInt();
       break;
 
     // For debugging.

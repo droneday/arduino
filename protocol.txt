@@ -7,11 +7,11 @@ command is a single character (the first character on the line).
 
 Valid commands:
 
-  X<value>    - Set desired movement in X dimension (through tilt of rotors).
-  Y<value>    - Set desired movement in Y dimension.
-  Z<value>    - Set desired movement in Z dimension (vertical thrust).
-  T<value>    - Set desired yaw rotation (rotation around Z axis).
-  D           - Debug: dump values of X, Y, Z, T and possibly other things.
+  P<value>    - Set desired pitch rotation.
+  R<value>    - Set desired roll rotation.
+  Y<value>    - Set desired yaw rotation.
+  T<value>    - Set desired throttle value (vertical thrust).
+  D           - Debug: dump values of P, R, Y, T and possibly other things.
   #<command>  - Briefly put the Bluetooth module into AT monitor mode and
                 execute the given command. Probably a very bad idea to do
                 this while in the air because it will interrupt the normal
