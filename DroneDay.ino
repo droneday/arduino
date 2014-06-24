@@ -4,6 +4,7 @@
 
 #include "MPU6050.h" // not necessary if using MotionApps include file
 #include "helper_3dmath.h"
+#include "controller.h"
 
 // Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
 // is used in I2Cdev.h
@@ -11,23 +12,10 @@
     #include "Wire.h"
 #endif
 
-// Friendly name to use for Bluetooth ID:
-#define BLUETOOTH_DRONE_NAME "DroneDayDrone"
-
-// Pin numbers for I/O pins connected to the Bluetooth board.
-// TODO: Configure these correctly.
-int bluetoothKey = -1;
-int bluetoothTx = 5;
-int bluetoothRx = 6;
-
-// Software UART for communicating with the Bluetooth board.
-SoftwareSerial bluetooth(bluetoothRx, bluetoothTx);
-
-// Input buffer for reading from the Bluetooth board.
-String bluetoothBuffer = "";
-
-// Current movement state received over Bluetooth.
-int cmdPitch, cmdRoll, cmdYaw, cmdThrottle;
+int MOTOR_PIN_FRONT = 3;
+int MOTOR_PIN_REAR = 10;
+int MOTOR_PIN_LEFT = 5;
+int MOTOR_PIN_RIGHT = 11;
 
 MPU6050 mpu;
 
@@ -39,6 +27,12 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     // turn it on here, so we know that if it stays solid, the program hung during setup
     digitalWrite(LED_PIN, HIGH);
+    
+    // turn off motors
+    analogWrite(MOTOR_PIN_FRONT, 0);
+    analogWrite(MOTOR_PIN_REAR, 0);
+    analogWrite(MOTOR_PIN_LEFT, 0);
+    analogWrite(MOTOR_PIN_RIGHT, 0);
     
     // join I2C bus (I2Cdev library doesn't do this automatically)
     #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
@@ -58,6 +52,8 @@ void setup() {
     Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
   
     calibrate_imu();
+    
+    delay(6000);
 
     // TODO:
     //bluetoothSetup();
@@ -121,29 +117,35 @@ void calibrate_imu()
     Serial.println(gyro_offset[2]);
 }
 
-float yaw=0, pitch=0, roll=0;
 void loop() {
-
-    readIMU();
+    static int lastTime = millis();
+    int thisTime = millis();
+    float dt = float(thisTime - lastTime)/1000;
+    lastTime = thisTime;
+  
+    State measured = readIMU(dt);
     
-    /*
-    static unsigned char count = 0;
-    if(!count++)
-    {
-      static int lastTime = millis();
-      int thisTime = millis();
-      Serial.print(256./((thisTime-lastTime)/1000.));
-      Serial.println(" Hz");
-      lastTime = thisTime;
+    //CommandedState command = readBluetooth();
+    CommandedState command = {0, 0, 0, 25};
+    
+    MotorPower pwm;
+    if(millis()/1000 < 12){
+      pwm = controller(dt, measured, command);
     }
-    */
+    else{
+      pwm.front=0; pwm.rear=0; pwm.left=0; pwm.right=0;
+    }
+
+    analogWrite(MOTOR_PIN_FRONT, pwm.front);
+    analogWrite(MOTOR_PIN_REAR,  pwm.rear);
+    analogWrite(MOTOR_PIN_LEFT,  pwm.left);
+    analogWrite(MOTOR_PIN_RIGHT, pwm.rear);
 
     // blink LED to indicate activity
     blinkState = !blinkState;
     digitalWrite(LED_PIN, blinkState);
+    
 
-    // TODO:
-    //bluetoothPoll();
 }
 
 Quaternion rpy2quat(float x, float y, float z)
@@ -169,14 +171,9 @@ void quat2rpy(Quaternion q, float* roll, float* pitch, float* yaw)
   *yaw = -*yaw; *pitch = -*pitch; *roll = -*roll;
 }
 
-void readIMU()
+float yaw=0, pitch=0, roll=0;
+State readIMU(float dt)
 {
-  // over what period are we integrating?
-  static int lastTime = millis();
-  int thisTime = millis();
-  float dt = float(thisTime - lastTime)/1000;
-  lastTime = thisTime;
-  
   // get body-frame rotational velocities and linear accelerations
   int16_t accel[3], gyro[3];
   mpu.getMotion6(&accel[0], &accel[1], &accel[2], &gyro[0], &gyro[1], &gyro[2]);
@@ -227,130 +224,14 @@ void readIMU()
   roll = roll*(1-accelFrac) + accel_roll*accelFrac;
   
   printrpy(roll, pitch, yaw);
+  
+  State measured;
+  static float lastYaw = yaw;;
+  measured.roll = roll;
+  measured.pitch = pitch;
+  measured.yaw_rate = (yaw - lastYaw) / dt;
+  
+  lastYaw = yaw;
 }
 
-// Setup function to initialize Bluetooth receiver.
-void bluetoothSetup() {
 
-  if (bluetoothKey >= 0) {
-    // Bluetooth board starts in passthrough mode.
-    pinMode(bluetoothKey, OUTPUT);
-    digitalWrite(bluetoothKey, LOW);
-  }
-
-  // Set up serial. 9600 is default baud.
-  // TODO: See if this is fast enough, and potentially raise
-  // to a higher baud rate through AT commands.
-  bluetooth.begin(9600);
-
-  // Default drone name,
-  bluetoothATCommand("AT+NAME=" BLUETOOTH_DRONE_NAME);
-}
-
-// Read a line of text from the Bluetooth device, stripping
-// the newline character.
-String bluetoothReadLine() {
-  String result = "";
-  for (;;) {
-    if (bluetooth.available()) {
-      char c = bluetooth.read();
-      if (c == '\r' || c == '\n') {
-        break;
-      } else {
-        result += c;
-      }
-    }
-  }
-  return result;
-}
-
-// Execute an AT command on the Bluetooth board.
-String bluetoothATCommand(String command) {
-
-  if (bluetoothKey < 0) {
-    return "Not supported.";
-  }
-
-  // Switch into AT command mode by toggling the KEY pin high.
-  digitalWrite(bluetoothKey, HIGH);
-  delay(250);  // TODO: Check if delay is needed.
-
-  // Send command to board and read the response.
-  bluetooth.println(command);
-  String response = bluetoothReadLine();
-
-  // Toggle back into normal passthrough mode.
-  digitalWrite(bluetoothKey, LOW);
-  delay(250);  // TODO: Check if delay is needed.
-
-  return response;
-}
-
-// Dump current configured control state over Bluetooth channel.
-void bluetoothDumpState() {
-  bluetooth.print("Pitch: ");
-  bluetooth.print(cmdPitch);
-  bluetooth.print(" Roll: ");
-  bluetooth.print(cmdRoll);
-  bluetooth.print(" Yaw: ");
-  bluetooth.print(cmdYaw);
-  bluetooth.print(" Throttle: ");
-  bluetooth.print(cmdThrottle);
-  bluetooth.println();
-  // TODO: Dump other useful info here.
-}
-
-// Parse and execute a complete command read from the Bluetooth
-// module.
-void bluetoothCommand() {
-  if (bluetoothBuffer.length() < 1) {
-    return;
-  }
-  switch (toupper(bluetoothBuffer[0])) {
-
-    // Normal flight commands: Adjust position and turn on
-    // axis.
-    case 'P':
-      cmdPitch = bluetoothBuffer.substring(1).toInt();
-      break;
-    case 'R':
-      cmdRoll = bluetoothBuffer.substring(1).toInt();
-      break;
-    case 'Y':
-      cmdYaw = bluetoothBuffer.substring(1).toInt();
-      break;
-    case 'T':
-      cmdThrottle = bluetoothBuffer.substring(1).toInt();
-      break;
-
-    // For debugging.
-    case 'D':
-      bluetoothDumpState();
-      break;
-
-    // Send AT command to Bluetooth board and read back the
-    // response. Useful if we want to do something like change
-    // the Bluetooth display name.
-    case '#':
-      bluetooth.println(bluetoothATCommand(bluetoothBuffer.substring(1)));
-      break;
-
-    default:
-      bluetooth.println("Unknown command type!");
-      break;
-  }
-}
-
-void bluetoothPoll() {
-  // Check for new characters received over Bluetooth.
-  // When a complete line has been read, process it as a command.
-  while (bluetooth.available()) {
-    char c = bluetooth.read();
-    if (c == '\r' || c == '\n') {
-      bluetoothCommand();
-      bluetoothBuffer = "";
-    } else {
-      bluetoothBuffer += c;
-    }
-  }
-}
